@@ -1,0 +1,173 @@
+import tkinter as tk
+import cv2
+import numpy as np
+from tkinter import filedialog, messagebox
+import ntpath
+from timeit import default_timer as timer
+
+# --- Global state ---
+click_count = 0            # number of clicks for endpoints
+click_points = np.zeros((2, 2), dtype=int)
+t_line_present = False     # was a bag on the line last frame
+total_count = 0            # total bags counted
+reflect_count = 0
+cap = None
+video_path = ""
+
+# --- Mouse callback to record two points ---
+def mouse_callback(event, x, y, flags, params):
+    global click_count, click_points
+    if event == cv2.EVENT_LBUTTONDOWN and click_count < 2:
+        click_points[click_count] = [x, y]
+        click_count += 1
+
+# --- Bag detection loop using ROI at midpoint ---
+def detect_bags():
+    global cap, click_points, reflect_count, t_line_present, total_count
+
+    # detection parameters
+    roi_offset = 10          # half-size of ROI square
+    threshold_value = 150    # gray threshold for bright bags
+    fps_delay = 33           # ~30 FPS
+
+    t_line_present = False
+    total_count = 0
+    start_time = timer()
+    iteration = 0
+    status = 0
+
+    # Precompute midpoint of line
+    x1, y1 = click_points[0]
+    x2, y2 = click_points[1]
+    mid_x = int((x1 + x2) / 2)
+    mid_y = int((y1 + y2) / 2)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Draw line
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Convert to gray and extract ROI
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        y0 = max(mid_y - roi_offset, 0)
+        y1r = min(mid_y + roi_offset, gray.shape[0])
+        x0 = max(mid_x - roi_offset, 0)
+        x1r = min(mid_x + roi_offset, gray.shape[1])
+        roi = gray[y0:y1r, x0:x1r]
+        mean_gray = float(np.mean(roi))
+
+        # Debug: show mean
+        cv2.putText(frame, f"Gray: {int(mean_gray)}", (10, frame.shape[0]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+        cv2.rectangle(frame, (x0, y0), (x1r, y1r), (255, 255, 0), 1)
+
+        # Presence detection: bright -> bag present
+        presence = mean_gray > threshold_value
+        if presence and not t_line_present:
+            total_count += 1
+            t_line_present = True
+            cv2.circle(frame, (mid_x, mid_y), 8, (0, 0, 255), -1)
+        elif not presence:
+            t_line_present = False
+
+        # Display count
+        cv2.putText(frame, f"Total: {total_count}", (mid_x+15, mid_y+5),
+                    cv2.FONT_HERSHEY_PLAIN, 1.2, (0, 255, 255), 2)
+
+        # Reflect notifications
+        if reflect_count > 0 and total_count > 0 and total_count % reflect_count == 0:
+            iteration += 1
+            start_time = timer()
+            status += 1
+
+        if status > 0:
+            cv2.putText(frame, f"Iteration {iteration}: {total_count}", (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        cv2.imshow("Counting", frame)
+        if cv2.waitKey(fps_delay) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    messagebox.showinfo("Result", f"Total Bags Count: {total_count}")
+
+# --- Setup line then start detection ---
+def start_counting():
+    global cap, reflect_count, click_count, click_points, t_line_present
+
+    # reset state
+    click_count = 0
+    click_points = np.zeros((2, 2), dtype=int)
+    t_line_present = False
+
+    # reflect interval
+    val = entry_reflect.get().strip()
+    reflect_count = int(val) if val.isdigit() else 0
+
+    # open capture
+    cap = cv2.VideoCapture(0) if use_camera_var.get() else cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    if not ret:
+        messagebox.showerror("Error", "Cannot read from source.")
+        cap.release()
+        return
+
+    # line drawing window
+    cv2.namedWindow("Select Line")
+    cv2.setMouseCallback("Select Line", mouse_callback)
+
+    while True:
+        temp = frame.copy()
+        for i in range(click_count):
+            cv2.circle(temp, tuple(click_points[i]), 5, (0, 255, 0), -1)
+        if click_count == 2:
+            cv2.line(temp, tuple(click_points[0]), tuple(click_points[1]), (0, 255, 0), 2)
+        cv2.imshow("Select Line", temp)
+        if cv2.waitKey(20) & 0xFF in (27, ord(' ')) or click_count >= 2:
+            break
+
+    cv2.destroyWindow("Select Line")
+    if click_count == 2:
+        detect_bags()
+    else:
+        messagebox.showwarning("Warning", "Select two points before starting.")
+
+# --- File dialog ---
+def open_file():
+    global video_path
+    path = filedialog.askopenfilename(
+        filetypes=[("Video Files", "*.mp4;*.avi;*.mov"), ("All Files", "*.*")]
+    )
+    if path:
+        video_path = path
+        lbl_file.config(text=ntpath.basename(path))
+
+# --- Build GUI ---
+root = tk.Tk()
+root.title("Bag Counting Tracker")
+root.geometry("600x300")
+
+# source selection
+tk.Label(root, text="Select Source:").place(x=20, y=20)
+use_camera_var = tk.BooleanVar(value=False)
+ck1 = tk.Radiobutton(root, text="Camera", variable=use_camera_var, value=True)
+ck1.place(x=150, y=20)
+ck2 = tk.Radiobutton(root, text="Video File", variable=use_camera_var, value=False, command=open_file)
+ck2.place(x=230, y=20)
+
+lbl_file = tk.Label(root, text="No file selected")
+lbl_file.place(x=350, y=20)
+
+# reflect input
+tk.Label(root, text="Notify every N bags:").place(x=20, y=60)
+entry_reflect = tk.Entry(root)
+entry_reflect.place(x=150, y=60)
+
+# start button
+tk.Button(root, text="Start Counting", command=start_counting).place(x=50, y=100)
+
+root.mainloop()
